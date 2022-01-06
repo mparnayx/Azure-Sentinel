@@ -16,9 +16,9 @@ import base64
 import re
 from threading import Thread
 from io import StringIO
+import platform
 
 import azure.functions as func
-
 
 sentinel_customer_id = os.environ.get('WorkspaceID')
 sentinel_shared_key = os.environ.get('WorkspaceKey')
@@ -47,11 +47,60 @@ isSplitAWSResourceTypes = os.environ.get('SplitAWSResourceTypes')
 # TODO: Read Collection schedule from environment variable as CRON expression; This is also Azure Function Trigger Schedule
 collection_schedule = int(fresh_event_timestamp)
 
+def is_json(myjson):
+    try:
+        json_object = json.loads(myjson)
+    except ValueError as e:
+        return False
+    return True
+
+def split_teleport(message):
+    is_between_quotes = False
+    return_arr = []
+    last_space_idx = -1
+    for i in range(len(message)):
+        char = message[i]
+        if char == '"':
+            is_between_quotes = not is_between_quotes
+        if char == ' ' and not is_between_quotes:
+            return_arr.append(message[last_space_idx+1:i])
+            last_space_idx = i
+    return return_arr
+
+def split_s3(message):
+    is_between_quotes = False
+    is_between_brackets = False
+    return_arr = []
+    last_space_idx = -1
+    for i in range(len(message)):
+        char = message[i]
+        if char == '"':
+            is_between_quotes = not is_between_quotes
+        if char == '[' and not is_between_brackets:
+            is_between_brackets = True
+        if char == ']' and is_between_brackets:
+            is_between_brackets = False
+        if char == ' ' and not is_between_quotes and not is_between_brackets:
+            return_arr.append(message[last_space_idx+1:i])
+            last_space_idx = i
+    for i in range(len(return_arr)):
+        if return_arr[i][0] == '"':
+            return_arr[i] = return_arr[i].strip('"')
+    return return_arr
+
+
 
 def main(mytimer: func.TimerRequest) -> None:
+    utc_timestamp = datetime.datetime.utcnow().replace(
+        tzinfo=datetime.timezone.utc).isoformat()
+
     if mytimer.past_due:
         logging.info('The timer is past due!')
 
+    logging.info('Python timer trigger function ran at %s', utc_timestamp)
+
+    logging.info(platform.python_version())
+    
     logging.info('Starting program')
     
     cli = S3Client(aws_access_key_id, aws_secret_acces_key, aws_region_name, aws_s3_bucket)
@@ -64,26 +113,345 @@ def main(mytimer: func.TimerRequest) -> None:
 
     failed_sent_events_number = 0
     successfull_sent_events_number = 0    
-    coreEvents = []   
+    coreEvents = [] 
+    failedEvents = [] 
+    file_events = 0
+    t0 = time.time()    
+    sentinel = AzureSentinelConnector(logAnalyticsUri, sentinel_customer_id, sentinel_shared_key, sentinel_log_type, queue_size=15000, bulks_number=10)
+ 
 
     for obj in obj_list:
         log_events = cli.process_obj(obj)       
         
         for log in log_events:
             if len(log) > 0:
-                coreEvents.append(log)
+                try:
+                    json_object = json.loads(log)
+                    if "id" in json_object:
+                        # Parse different log types
+                        
+                        if json_object['metadata']['tags']['resource_type'] == 'vpc-log':
+                            #vpc-log
+                            message = json_object['message']
+                            """ <version> <account-id> <interface-id> <srcaddr> <dstaddr> <srcport> <dstport> <protocol> <packets> <bytes> <start> <end> <action> <log-status>"""
+
+                            msg_arr = message.split(' ')
+
+                            json_object['message'] = {}
+
+                            json_object['message']['cn1'] = msg_arr[0] if msg_arr[0] != '-' else ''
+                            json_object['message']['cn1Label'] = 'The VPC Flow Logs version.'
+                            json_object['message']['cs3'] = msg_arr[1] if msg_arr[1] != '-' else ''
+                            json_object['message']['cs3Label'] = 'The AWS account ID of the owner of the source network interface for which traffic is recorded.'
+                            json_object['message']['cs4'] = msg_arr[2] if msg_arr[2] != '-' else ''
+                            json_object['message']['cs4Label'] = 'The ID of the network interface for which the traffic is recorded.'
+                            json_object['message']['src'] = msg_arr[3] if msg_arr[3] != '-' else ''
+                            json_object['message']['dst'] = msg_arr[4] if msg_arr[4] != '-' else ''
+                            json_object['message']['spt'] = msg_arr[5] if msg_arr[5] != '-' else ''
+                            json_object['message']['dpt'] = msg_arr[6] if msg_arr[6] != '-' else ''
+                            json_object['message']['cn2'] = msg_arr[7] if msg_arr[7] != '-' else ''
+                            json_object['message']['cn2Label'] = 'The IANA protocol number of the traffic.'
+                            json_object['message']['cn3'] = msg_arr[8] if msg_arr[8] != '-' else ''
+                            json_object['message']['cn3Label'] = 'The number of packets transferred during the flow.'
+                            json_object['message']['in'] = msg_arr[9] if msg_arr[9] != '-' else ''
+                            json_object['message']['cs1'] = msg_arr[10] if msg_arr[10] != '-' else ''
+                            json_object['message']['cs1Label'] = 'The time, in Unix seconds, when the first packet of the flow was received within the aggregation interval.'
+                            json_object['message']['cs2'] = msg_arr[11] if msg_arr[11] != '-' else ''
+                            json_object['message']['cs2Label'] = 'The time, in Unix seconds, when the last packet of the flow was received within the aggregation interval.'
+                            json_object['message']['act'] = msg_arr[12] if msg_arr[12] != '-' else ''
+                            json_object['message']['log-status'] = msg_arr[13] if msg_arr[13] != '-' else ''
+
+                            log = json.dumps(json_object)
+                        elif json_object['metadata']['tags']['resource_type'] == 'cloudfront':
+                            #cloudfront
+                            message = json_object['message']
+                            
+                            msg_arr = message.split('\t')
+                            
+                            json_object['message'] = {}
+                            
+                            json_object['message']['date'] = msg_arr[0] if msg_arr[0] != '-' else ''
+                            json_object['message']['time'] = msg_arr[1] if msg_arr[1] != '-' else ''
+                            json_object['message']['cs1'] = msg_arr[2] if msg_arr[2] != '-' else ''
+                            json_object['message']['cs1Label'] = 'The edge location that served the request.'
+                            json_object['message']['out'] = msg_arr[3] if msg_arr[3] != '-' else ''
+                            json_object['message']['src'] = msg_arr[4] if msg_arr[4] != '-' else ''
+                            json_object['message']['requestMethod'] = msg_arr[5] if msg_arr[5] != '-' else ''
+                            json_object['message']['cs2'] = msg_arr[6] if msg_arr[6] != '-' else ''
+                            json_object['message']['cs2Label'] = 'The domain name of the CloudFront distribution.'
+                            json_object['message']['filePath'] = msg_arr[7] if msg_arr[7] != '-' else ''
+                            json_object['message']['cn1'] = msg_arr[8] if msg_arr[8] != '-' else ''
+                            json_object['message']['cn1Label'] = "The HTTP status code of the server's response."
+                            json_object['message']['requestContext'] = msg_arr[9] if msg_arr[9] != '-' else ''
+                            json_object['message']['requestClientApplication'] = msg_arr[10] if msg_arr[10] != '-' else ''
+                            json_object['message']['cs3'] = msg_arr[11] if msg_arr[11] != '-' else ''
+                            json_object['message']['cs3Label'] = 'The query string portion of the request URL, if any.'
+                            json_object['message']['requestCookies'] = msg_arr[12] if msg_arr[12] != '-' else ''
+                            json_object['message']['act'] = msg_arr[13] if msg_arr[13] != '-' else ''
+                            json_object['message']['cs4'] = msg_arr[14] if msg_arr[14] != '-' else ''
+                            json_object['message']['cs4Label'] = 'An opaque string that uniquely identifies a request.'
+                            json_object['message']['dhost'] = msg_arr[15] if msg_arr[15] != '-' else ''
+                            json_object['message']['app'] = msg_arr[16] if msg_arr[16] != '-' else ''
+                            json_object['message']['in'] = msg_arr[17] if msg_arr[17] != '-' else ''
+                            json_object['message']['cn2'] = msg_arr[18] if msg_arr[18] != '-' else ''
+                            json_object['message']['cn2Label'] =  "The number of seconds (to the thousandth of a second) from when the server receives the viewer's request to when the server writes the last byte of the response to the output queue, as measured on the server."
+                            json_object['message']['cs5'] = msg_arr[19] if msg_arr[19] != '-' else ''
+                            json_object['message']['cs5Label'] = 'x-forwarded-for'
+                            json_object['message']['cs6'] = msg_arr[22] if msg_arr[22] != '-' else ''
+                            json_object['message']['cs6Label'] = "How the server classified the response just before returning the response to the viewer."
+                            json_object['message']['dpt'] = msg_arr[26] if msg_arr[26] != '-' else ''
+                            json_object['message']['cn3'] = msg_arr[27] if msg_arr[27] != '-' else ''
+                            json_object['message']['cn3Label'] = "The number of seconds between receiving the request and writing the first byte of the response, as measured on the server."
+                            json_object['message']['flexString1'] = msg_arr[28] if msg_arr[28] != '-' else ''
+                            json_object['message']['flexString1Label'] = "When the value of the x-edge-result-type field (cs6) is Error, this field contains the specific type of error."
+
+                            log = json.dumps(json_object)
+
+                        elif json_object['metadata']['tags']['resource_type'] == 'dns':
+                            message = json_object['message']
+                            if message[0] != '{':
+                                msg_arr = message.split(' ')
+                                json_object['message'] = {}
+                                
+                                json_object['message']['version'] = msg_arr[0] if msg_arr[0] != '-' else ''
+                                json_object['message']['account-id'] = msg_arr[1] if msg_arr[1] != '-' else ''
+                                json_object['message']['interface-id'] = msg_arr[2] if msg_arr[2] != '-' else ''
+                                json_object['message']['srcaddr'] = msg_arr[3] if msg_arr[3] != '-' else ''
+                                json_object['message']['dstaddr'] = msg_arr[4] if msg_arr[4] != '-' else ''
+                                json_object['message']['srcport'] = msg_arr[5] if msg_arr[5] != '-' else ''
+                                json_object['message']['dstport'] = msg_arr[6] if msg_arr[6] != '-' else ''
+                                json_object['message']['protocol'] = msg_arr[7] if msg_arr[7] != '-' else ''
+                                json_object['message']['packets'] = msg_arr[8] if msg_arr[8] != '-' else ''
+                                json_object['message']['bytes'] = msg_arr[9] if msg_arr[9] != '-' else ''
+                                json_object['message']['start'] = msg_arr[10] if msg_arr[10] != '-' else ''
+                                json_object['message']['end'] = msg_arr[11] if msg_arr[11] != '-' else ''
+                                json_object['message']['action'] = msg_arr[12] if msg_arr[12] != '-' else ''
+                                json_object['message']['log-status'] = msg_arr[13] if msg_arr[13] != '-' else ''
+                            else:
+                                message_object = json.loads(message)
+                                
+                                json_object['message'] = {}
+                                
+                                json_object['message']['cs1'] = message_object['account_id'] if 'account_id' in message_object else ''
+                                json_object['message']['cs1Label'] = 'The ID of the AWS account that created the VPC.'
+                                json_object['message']['cs2'] = message_object['region'] if 'region' in message_object else ''
+                                json_object['message']['cs2Label'] = 'The AWS Region that you created the VPC in.'
+                                json_object['message']['cs3'] = message_object['vpc_id'] if 'vpc_id' in message_object else ''
+                                json_object['message']['cs3Label'] = 'The date and time that the query was submitted in ISO 8601 format and Coordinated Universal Time (UTC).'
+                                json_object['message']['deviceCustomDate1'] = message_object['query_timestamp'] if 'query_timestamp' in message_object else ''
+                                json_object['message']['deviceCustomDate1Label'] = 'queryTimeStamp'
+                                json_object['message']['Name'] = message_object['query_name'] if 'query_name' in message_object else ''
+                                json_object['message']['QueryType'] = message_object['query_type'] if 'query_type' in message_object else ''
+                                json_object['message']['cs4'] = message_object['rcode'] if 'rcode' in message_object else ''
+                                json_object['message']['cs4Label'] = 'The DNS response code that Resolver returned in response to the DNS query.'
+                                json_object['message']['IPAddresses'] = []
+                                if 'answers' in message_object:
+                                    for obj in message_object['answers']:
+                                        json_object['message']['IPAddresses'].append(obj['Rdata'])
+                                json_object['message']['ClientIP'] = message_object['srcaddr'] if 'srcaddr' in message_object else ''
+                                json_object['message']['cs5'] = message_object['srcids']['instance'] if 'srcids' in message_object and 'instance' in message_object['srcids'] else ''
+
+                            log = json.dumps(json_object)
+                        
+
+                        elif json_object['metadata']['tags']['resource_type'] == 'teleport_alb' or json_object['metadata']['tags']['resource_type'] == 'public-elb' or json_object['metadata']['tags']['resource_type'] == 'private-elb':
+
+                            message = json_object['message']
+                            
+                            msg_arr = split_teleport(message)
+                            
+                            json_object['message'] = {}
+                            
+                            json_object['message']['app'] = msg_arr[0] if msg_arr[0] != '"-"' else ''
+                            json_object['message']['deviceCustomDate1'] = msg_arr[1] if msg_arr[1] != '"-"' else ''
+                            json_object['message']['deviceCustomDate1Label'] = 'The time when the load balancer generated a response to the client, in ISO 8601 format.'
+                            json_object['message']['dvchost'] = msg_arr[2] if msg_arr[2] != '"-"' else ''
+                            json_object['message']['src'] = msg_arr[3].split(':')[0] if msg_arr[3] != '"-"' and msg_arr[3] != '-' and ':' in msg_arr[3] else ''
+                            json_object['message']['spt'] = msg_arr[3].split(':')[1] if msg_arr[3] != '"-"' and msg_arr[3] != '-' and ':' in msg_arr[3] else ''
+                            json_object['message']['dst'] = msg_arr[4].split(':')[0] if msg_arr[4] != '"-"' and msg_arr[4] != '-' and ':' in msg_arr[4] else ''
+                            json_object['message']['dpt'] = msg_arr[4].split(':')[1] if msg_arr[4] != '"-"' and msg_arr[4] != '-' and ':' in msg_arr[4] else ''
+                            json_object['message']['cfp1'] = msg_arr[5] if msg_arr[5] != '"-"' else ''
+                            json_object['message']['cfp1Label'] = 'The total time elapsed (in seconds, with millisecond precision) from the time the load balancer received the request until the time it sent the request to a target.'
+                            json_object['message']['cfp2'] = msg_arr[6] if msg_arr[6] != '"-"' else ''
+                            json_object['message']['cfp2Label'] = 'The total time elapsed (in seconds, with millisecond precision) from the time the load balancer sent the request to a target until the target started to send the response headers.'
+                            json_object['message']['cfp3'] = msg_arr[7] if msg_arr[7] != '"-"' else ''
+                            json_object['message']['cfp3Label'] = 'The total time elapsed (in seconds, with millisecond precision) from the time the load balancer received the response header from the target until it started to send the response to the client.'
+                            json_object['message']['cn1'] = msg_arr[8] if msg_arr[8] != '"-"' else ''
+                            json_object['message']['cn1Label'] = 'The status code of the response from the load balancer.'
+                            json_object['message']['cn2'] = msg_arr[9] if msg_arr[9] != '"-"' else ''
+                            json_object['message']['cn2Label'] = 'The status code of the response from the target.'
+                            json_object['message']['in'] = msg_arr[10] if msg_arr[10] != '"-"' else ''
+                            json_object['message']['out'] = msg_arr[11] if msg_arr[11] != '"-"' else ''
+                            json_object['message']['requestMethod'] = msg_arr[12].strip('"').split(' ')[0] if msg_arr[12] != '"-"' else ''
+                            json_object['message']['request'] = msg_arr[12].strip('"').split(' ')[1] if msg_arr[12] != '"-"' else ''
+                            json_object['message']['requestClientApplication'] = msg_arr[13].strip('"') if msg_arr[13] != '"-"' else ''
+                            json_object['message']['cs1'] = msg_arr[14] if msg_arr[14] != '"-"' else ''
+                            json_object['message']['cs1Label'] = 'SSL_Cipher'
+                            json_object['message']['cs2'] = msg_arr[15] if msg_arr[15] != '"-"' else ''
+                            json_object['message']['cs2Label'] = 'ssl_Protocol'
+                            json_object['message']['cs3'] = msg_arr[16] if msg_arr[16] != '"-"' else ''
+                            json_object['message']['cs3Label'] = 'target_group_arn'
+                            json_object['message']['cs4'] = msg_arr[17].strip('"') if msg_arr[17] != '"-"' else ''
+                            json_object['message']['cs4Label'] = 'trace_id'
+                            json_object['message']['dhost'] = msg_arr[18].strip('"') if msg_arr[18] != '"-"' else ''
+                            json_object['message']['cs5'] = msg_arr[19].strip('"') if msg_arr[19] != '"-"' else ''
+                            json_object['message']['cs5Label'] = 'chosen_cert_arn'
+                            json_object['message']['cn3'] = msg_arr[20] if msg_arr[20] != '"-"' else ''
+                            json_object['message']['cn3Label'] = 'Matched_rule_priority'
+                            json_object['message']['flexDate1'] = msg_arr[21] if msg_arr[21] != '"-"' else ''
+                            json_object['message']['flexDate1Label'] = 'The time when the load balancer received the request from the client, in ISO 8601 format.'
+                            json_object['message']['act'] = msg_arr[22].strip('"') if msg_arr[22] != '"-"' else ''
+                            json_object['message']['cs6'] = msg_arr[23].strip('"') if msg_arr[23] != '"-"' else ''
+                            json_object['message']['cs6Label'] = 'redirect_url'
+                            
+                            
+                            
+                            log = json.dumps(json_object)
+
+                        elif json_object['metadata']['tags']['resource_type'] == 's3':
     
-    file_events = 0
-    t0 = time.time()    
-    logging.info('Total number of files is {}'.format(len(coreEvents)))                                                                       
-    for event in coreEvents:
-        sentinel = AzureSentinelConnector(logAnalyticsUri, sentinel_customer_id, sentinel_shared_key, sentinel_log_type, queue_size=10000, bulks_number=10)
-        with sentinel:
+                            message = json_object['message']
+                            
+                            msg_arr = split_s3(message)
+                            
+                            json_object['message'] = {}
+                            
+                            json_object['message']['cs1'] = msg_arr[0] if msg_arr[0] != '-' else ''
+                            json_object['message']['cs1Label'] = 'The canonical user ID of the owner of the source bucket.'
+                            json_object['message']['cs2'] = msg_arr[1] if msg_arr[1] != '-' else ''
+                            json_object['message']['cs2Label'] = 'The name of the bucket that the request was processed against.'
+                            json_object['message']['cs3'] = msg_arr[2] if msg_arr[2] != '-' else ''
+                            json_object['message']['cs3Label'] = 'The time at which the request was received; these dates and times are in Coordinated Universal Time (UTC)'
+                            json_object['message']['src'] = msg_arr[3] if msg_arr[3] != '-' else ''
+                            json_object['message']['cs4'] = msg_arr[4] if msg_arr[4] != '-' else ''
+                            json_object['message']['cs4Label'] = 'The canonical user ID of the requester, or a - for unauthenticated requests.'
+                            json_object['message']['cs5'] = msg_arr[5] if msg_arr[5] != '-' else ''
+                            json_object['message']['cs5Label'] = 'A string generated by Amazon S3 to uniquely identify each request.'
+                            json_object['message']['cs6'] = msg_arr[6] if msg_arr[6] != '-' else ''
+                            json_object['message']['cs6Label'] = 'The operation listed here is declared as SOAP.operation, REST.HTTP_method.resource_type, WEBSITE.HTTP_method.resource_type, or BATCH.DELETE.OBJECT, or S3.action.resource_type.'
+                            json_object['message']['flexString1'] = msg_arr[7] if msg_arr[7] != '-' else ''
+                            json_object['message']['flexString1Label'] = 'The "key" part of the request, URL encoded, or "-" if the operation does not take a key parameter.'
+                            json_object['message']['RequestMethod'] = msg_arr[8].split(' ')[0] if msg_arr[8] != '-' else ''
+                            json_object['message']['Request'] = msg_arr[8].split(' ')[1] if msg_arr[8] != '-' else ''
+                            json_object['message']['Outcome'] = msg_arr[9] if msg_arr[9] != '-' else ''
+                            json_object['message']['ErrorCode'] = msg_arr[10] if msg_arr[10] != '-' else ''
+                            json_object['message']['out'] = msg_arr[11] if msg_arr[11] != '-' else ''
+                            json_object['message']['ObjectSize'] = msg_arr[12] if msg_arr[12] != '-' else ''
+                            json_object['message']['cn1'] = msg_arr[13] if msg_arr[13] != '-' else ''
+                            json_object['message']['cn1Label'] = 'The number of milliseconds the request was in flight from the server\'s perspective.'
+                            json_object['message']['cn2'] = msg_arr[14] if msg_arr[14] != '-' else ''
+                            json_object['message']['cn2Label'] = 'The number of milliseconds that Amazon S3 spent processing your request.'
+                            json_object['message']['requestContext'] = msg_arr[15] if msg_arr[15] != '-' else ''
+                            json_object['message']['requestClientApplication'] = msg_arr[16] if msg_arr[16] != '-' else ''
+                            json_object['message']['flexString2'] = msg_arr[18] if msg_arr[18] != '-' else ''
+                            json_object['message']['flexString2Label'] = 'The x-amz-id-2 or Amazon S3 extended request ID.'
+                            json_object['message']['dhost'] = msg_arr[22] if msg_arr[22] != '-' else ''
+                            json_object['message']['proto'] = msg_arr[23] if msg_arr[23] != '-' else ''
+                            
+                            log = json.dumps(json_object)
+
+                        elif json_object['metadata']['tags']['resource_type'] == 'waf':
+                            message = json_object['message']
+                            message_object = json.loads(message)
+                            
+                            http_request = message_object['httpRequest']
+                            headers = http_request['headers']
+                            
+                            dhost = ''
+                            requestContext = ''
+                            for header in headers:
+                                if header['name'].lower() == 'host':
+                                    dhost = header['value']
+                                elif header['name'].lower() == 'referer':
+                                    requestContext = header['value']
+                            
+                            json_object['message'] = {}
+                            
+                            json_object['message']['act'] = message_object['action'] if 'action' in message_object else ''
+                            json_object['message']['src'] = http_request['clientIp'] if 'clientIp' in http_request else ''
+                            json_object['message']['requestMethod'] = http_request['httpMethod'] if 'httpMethod' in http_request else ''
+                            json_object['message']['request'] = http_request['uri'] if 'uri' in http_request else ''
+                            json_object['message']['requestId'] = http_request['requestId'] if 'requestId' in http_request else ''
+                            json_object['message']['cs1'] = http_request['country'] if 'country' in http_request else ''
+                            json_object['message']['cs1Label'] = 'The source country of the request. If AWS WAF is unable to determine the country of origin, it sets this field to -.'
+                            json_object['message']['cs2'] = message_object['ruleGroupList'] if 'ruleGroupList' in message_object else ''
+                            json_object['message']['cs2Label'] = 'The list of rule groups that acted on this request.'
+                            json_object['message']['cs3'] = message_object['terminatingRuleId'] if 'terminatingRuleId' in message_object else ''
+                            json_object['message']['cs3Label'] = 'The ID of the rule that terminated the request. If nothing terminates the request, the value is Default_Action.'
+                            json_object['message']['deviceCustomDate1'] = message_object['timestamp'] if 'timestamp' in message_object else ''
+                            json_object['message']['deviceCustomDate1Label'] = 'Timestamp of the request.'
+                            json_object['message']['dhost'] = dhost
+                            json_object['message']['requestContext'] = requestContext
+                            
+                            log = json.dumps(json_object)
+                        
+                        elif json_object['metadata']['tags']['resource_type'] == 'cloudtrail':
+
+                            message = json_object['message']
+                            message_object = json.loads(message)
+                            
+                            json_object['message'] = {}
+                            
+                            json_object['message']['EventVersion'] = message_object['eventVersion'] if 'eventVersion' in message_object else ''
+                            json_object['message']['UserIdentityType'] = message_object['userIdentity']['type'] if 'userIdentity' in message_object and 'type' in message_object['userIdentity'] else ''
+                            json_object['message']['UserIdentityPrincipalId'] = message_object['userIdentity']['principalId'] if 'userIdentity' in message_object and 'principalId' in message_object['userIdentity'] else ''
+                            json_object['message']['UserIdentityArn'] = message_object['userIdentity']['arn'] if 'userIdentity' in message_object and 'arn' in message_object['userIdentity'] else ''
+                            json_object['message']['UserIdentityAccountId'] = message_object['userIdentity']['accountId'] if 'userIdentity' in message_object and 'accountId' in message_object['userIdentity'] else ''
+                            json_object['message']['UserIdentityAccessKeyId'] = message_object['userIdentity']['accessKeyId'] if 'userIdentity' in message_object and 'accessKeyId' in message_object['userIdentity'] else ''
+                            json_object['message']['SessionIssuerType'] = message_object['userIdentity']['sessionContext']['sessionIssuer']['type'] if 'userIdentity' in message_object and 'sessionContext' in message_object['userIdentity'] and 'sessionIssuer' in message_object['userIdentity']['sessionContext'] and 'type' in message_object['userIdentity']['sessionContext']['sessionIssuer'] else ''
+                            json_object['message']['SessionIssuerPrincipalId'] = message_object['userIdentity']['sessionContext']['sessionIssuer']['principalId'] if 'userIdentity' in message_object and 'sessionContext' in message_object['userIdentity'] and 'sessionIssuer' in message_object['userIdentity']['sessionContext'] and 'principalId' in message_object['userIdentity']['sessionContext']['sessionIssuer'] else ''
+                            json_object['message']['SessionIssuerArn'] = message_object['userIdentity']['sessionContext']['sessionIssuer']['arn'] if 'userIdentity' in message_object and 'sessionContext' in message_object['userIdentity'] and 'sessionIssuer' in message_object['userIdentity']['sessionContext'] and 'arn' in message_object['userIdentity']['sessionContext']['sessionIssuer'] else ''
+                            json_object['message']['SessionIssuerAccountId'] = message_object['userIdentity']['sessionContext']['sessionIssuer']['accountId'] if 'userIdentity' in message_object and 'sessionContext' in message_object['userIdentity'] and 'sessionIssuer' in message_object['userIdentity']['sessionContext'] and 'accountId' in message_object['userIdentity']['sessionContext']['sessionIssuer'] else ''
+                            json_object['message']['SessionIssuerUserName'] = message_object['userIdentity']['sessionContext']['sessionIssuer']['userName'] if 'userIdentity' in message_object and 'sessionContext' in message_object['userIdentity'] and 'sessionIssuer' in message_object['userIdentity']['sessionContext'] and 'userName' in message_object['userIdentity']['sessionContext']['sessionIssuer'] else ''
+                            json_object['message']['SessionCreationDate'] = message_object['userIdentity']['sessionContext']['attributes']['creationDate'] if 'userIdentity' in message_object and 'sessionContext' in message_object['userIdentity'] and 'attributes' in message_object['userIdentity']['sessionContext'] and 'creationDate' in message_object['userIdentity']['sessionContext']['attributes'] else ''
+                            json_object['message']['SessionMfaAuthenticated'] = message_object['userIdentity']['sessionContext']['attributes']['mfaAuthenticated'] if 'userIdentity' in message_object and 'sessionContext' in message_object['userIdentity'] and 'attributes' in message_object['userIdentity']['sessionContext'] and 'mfaAuthenticated' in message_object['userIdentity']['sessionContext']['attributes'] else ''
+                            json_object['message']['EventSource'] = message_object['eventSource'] if 'eventSource' in message_object else ''
+                            json_object['message']['EventName'] = message_object['eventName'] if 'eventName' in message_object else ''
+                            json_object['message']['AWSRegion'] = message_object['awsRegion'] if 'awsRegion' in message_object else ''
+                            json_object['message']['SourceAddress'] = message_object['sourceIPAddress'] if 'sourceIPAddress' in message_object else ''
+                            json_object['message']['UserAgent'] = message_object['userAgent'] if 'userAgent' in message_object else ''
+                            json_object['message']['RequestParamters'] = message_object['requestParamters'] if 'requestParamters' in message_object else ''
+                            json_object['message']['AWSRequestId_'] = message_object['requestID'] if 'requestID' in message_object else ''
+                            json_object['message']['AWSEventId'] = message_object['eventID'] if 'eventID' in message_object else ''
+                            json_object['message']['ReadOnly'] = message_object['readOnly'] if 'readOnly' in message_object else ''
+                            json_object['message']['EventTypeName'] = message_object['eventType'] if 'eventType' in message_object else ''
+                            json_object['message']['ManagementEvent'] = message_object['managementEvent'] if 'managementEvent' in message_object else ''
+                            json_object['message']['RecipientAccountId'] = message_object['recipientAccountId'] if 'recipientAccountId' in message_object else ''
+                            json_object['message']['ErrorCode'] = message_object['errorCode'] if 'errorCode' in message_object else ''
+                            json_object['message']['ErrorMessage'] = message_object['erorMessage'] if 'erorMessage' in message_object else ''
+                            
+                            log = json.dumps(json_object)
+
+                        coreEvents.append(log)
+                    else:
+                        pass
+                except ValueError as e:
+                    pass
+
+        if len(coreEvents) > 1000000:
+            with sentinel:                                                        
+                for event in coreEvents:
+                    #if file_events % 1000 == 0:
+                        #logging.info("{} events parsed.".format(file_events))
+                    sentinel.send(event)
+                    file_events += 1 
+            failed_sent_events_number += sentinel.failed_sent_events_number
+            successfull_sent_events_number += sentinel.successfull_sent_events_number
+            del coreEvents
+            coreEvents = []            
+    
+    #logging.info('Total number of files is {}'.format(len(coreEvents)))    
+
+
+    with sentinel:                                                        
+        for event in coreEvents:
+            #if file_events % 1000 == 0:
+                #logging.info("{} events parsed.".format(file_events))
             sentinel.send(event)
-        file_events += 1 
-        failed_sent_events_number += sentinel.failed_sent_events_number
-        successfull_sent_events_number += sentinel.successfull_sent_events_number
-        
+            file_events += 1 
+    failed_sent_events_number += sentinel.failed_sent_events_number
+    successfull_sent_events_number += sentinel.successfull_sent_events_number
+
     if failed_sent_events_number:
         logging.info('{} AWS S3 files have not been sent'.format(failed_sent_events_number))
 
@@ -92,6 +460,17 @@ def main(mytimer: func.TimerRequest) -> None:
 
     if successfull_sent_events_number == 0 and failed_sent_events_number == 0:
         logging.info('No Fresh AWS S3 files')
+
+    logging.info("{} logs failed to parse or were discarded".format(len(failedEvents)))
+
+
+    logging.info("End Program")
+
+
+
+
+
+"""========== End Runtime ==========="""
 
 def convert_list_to_csv_line(ls):
     line = StringIO()
@@ -158,11 +537,18 @@ class S3Client:
         return ts_from, ts_to                   
     
     def _make_objects_list_request(self, marker='', prefix=''):
-        response = self.s3.list_objects(
+        if marker == '':
+            response = self.s3.list_objects_v2(
             Bucket=self.aws_s3_bucket, 
-            Marker=marker,
             Prefix=prefix
-        )
+            )
+        else:
+            response = self.s3.list_objects_v2(
+            Bucket=self.aws_s3_bucket, 
+            ContinuationToken=marker,
+            Prefix=prefix
+            )
+        
         try:
             response_code = response.get('ResponseMetadata', {}).get('HTTPStatusCode', None)
             if response_code == 200:
@@ -179,8 +565,11 @@ class S3Client:
 
         marker_end = (ts_from - datetime.timedelta(minutes=60)).strftime("/%Y-%m-%d/%Y-%m-%d-%H-%M")
         
-        for o in folders.get('CommonPrefixes'):        
-            marker = o.get('Prefix') + s3_folder + marker_end   
+        for o in folders.get('CommonPrefixes'):
+            prefix = o.get('Prefix')
+            if "error" in prefix.lower():
+                continue        
+            marker = ""#o.get('Prefix') + s3_folder + marker_end   
             folder = o.get('Prefix') + s3_folder           
             while True:                
                 response = self._make_objects_list_request(marker=marker, prefix=folder)
@@ -189,7 +578,7 @@ class S3Client:
                         files.append(file_obj)
 
                 if response['IsTruncated'] is True:
-                    marker = response['Contents'][-1]['Key']
+                    marker = response['NextContinuationToken']
                 else:
                     break
 
@@ -269,7 +658,17 @@ class S3Client:
             sortedLogEvents = self.parse_log_file(csv_file)
         elif '.json' in key.lower():
             downloaded_obj = self.download_obj(key)
-            sortedLogEvents = self.unpack_file(downloaded_obj, key)            
+            sortedLogEvents = self.unpack_file(downloaded_obj, key)    
+        else:
+            downloaded_obj = self.download_obj(key)
+            sortedLogEvents = []
+            try:
+                sortedLogEvents = gzip.decompress(downloaded_obj).decode().split('\n')
+            except:
+                try:
+                    sortedLogEvents = gzip.decompress(gzip.decompress(downloaded_obj)).decode().split('\n')
+                except:
+                    logging.error("Unable to process file: {}".format(key))               
             
         return sortedLogEvents
 
@@ -521,7 +920,8 @@ class AzureSentinelConnector:
 
         for job in jobs:
             job.join()
-
+        logging.info('{} events have been successfully sent to Azure Sentinel'.format(self.successfull_sent_events_number))
+        logging.error("{} events have failed sending to Azure Sentinel".format(self.failed_sent_events_number))
         self._bulks_list = []
 
     def __enter__(self):
@@ -542,9 +942,23 @@ class AzureSentinelConnector:
     def _post_data(self, customer_id, shared_key, body, log_type):
         events_number = len(body)
         body = json.dumps(body)
-        body = re.sub(r'\\', '', body)
-        body = re.sub(r'"{', '{', body)
-        body = re.sub(r'}"', '}', body)
+        #body = re.sub(r'\\', '', body)
+        #body = re.sub(r'"{', '{', body)
+        #body = re.sub(r'}"', '}', body)
+        body = body.replace('\\\\','\\')
+        body = body.replace('["{','[{')
+        body = body.replace('}"]','}]')
+        body = body.replace('", "',', ')
+        
+        temp = ""
+        for i in range(len(body)):
+            if body[i] == "\\":
+                if body[i+1] == "\\":
+                    temp = temp + "\\"
+                    i += 1
+            else:
+                temp = temp + body[i]
+        body = temp
         method = 'POST'
         content_type = 'application/json'
         resource = '/api/logs'
@@ -561,12 +975,17 @@ class AzureSentinelConnector:
         }
 
         response = requests.post(uri, data=body, headers=headers)
+        #print("Response Code: {}".format(response.status_code))
+        #sys.stdout.flush()
+        #logging.info("Response Code: {}".format(response.status_code))
+        #logging.info("Response Text: {}".format(response.text))
         if (response.status_code >= 200 and response.status_code <= 299):
             logging.info('{} events have been successfully sent to Azure Sentinel'.format(events_number))
             self.successfull_sent_events_number += events_number
         else:
             logging.error("Error during sending events to Azure Sentinel. Response code: {}".format(response.status_code))
             self.failed_sent_events_number += events_number
+        
 
     def _check_size(self, queue):
         data_bytes_len = len(json.dumps(queue).encode())
